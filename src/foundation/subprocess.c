@@ -135,8 +135,8 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
 /* ── Windows command-line quoting (pure; unit-tested on every platform) ─────── */
 
 /* Append char `c` to buf[cap], reserving the final byte for a NUL terminator.
- * Sets *ovf on overflow and stops writing; pos keeps advancing so the caller
- * still detects the overflow after the loop. */
+ * On overflow: sets *ovf, stops writing, and returns pos UNCHANGED — callers detect
+ * the overflow via the *ovf flag (not via the return value). */
 static size_t cbm_cmdline_put(char *buf, size_t cap, size_t pos, char c, bool *ovf) {
     if (pos + 1 >= cap) {
         *ovf = true;
@@ -213,6 +213,7 @@ bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv) {
     for (int i = 0; argv[i]; i++) {
         pos = cbm_cmdline_append_arg(buf, cap, pos, argv[i], i == 0, &ovf);
         if (ovf) {
+            buf[0] = '\0'; /* overflow: leave buf a valid (empty) string, never unterminated */
             return false;
         }
     }

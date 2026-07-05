@@ -195,6 +195,15 @@ static int parse_win_cmdline(const char *cmd, char out[][256], int max_args) {
         char *o = out[argc];
         size_t oi = 0;
         bool in_quotes = false;
+        /* Guard every write: each out[] row is 256 bytes; test args stay well under
+         * that, but cap defensively so a future longer arg fails a length assertion
+         * rather than smashing the stack. */
+#define PUTO(ch)            \
+    do {                    \
+        if (oi < 255) {     \
+            o[oi++] = (ch); \
+        }                   \
+    } while (0)
         for (;;) {
             size_t nbs = 0;
             while (*p == '\\') {
@@ -203,24 +212,26 @@ static int parse_win_cmdline(const char *cmd, char out[][256], int max_args) {
             }
             if (*p == '"') {
                 for (size_t k = 0; k < nbs / 2; k++) {
-                    o[oi++] = '\\';
+                    PUTO('\\');
                 }
                 if (nbs % 2) {
-                    o[oi++] = '"'; /* odd run → the quote is an escaped literal */
+                    PUTO('"'); /* odd run → the quote is an escaped literal */
                 } else {
                     in_quotes = !in_quotes; /* even run → the quote is a delimiter */
                 }
                 p++;
             } else {
                 for (size_t k = 0; k < nbs; k++) {
-                    o[oi++] = '\\';
+                    PUTO('\\');
                 }
                 if (*p == '\0' || (!in_quotes && (*p == ' ' || *p == '\t'))) {
                     break;
                 }
-                o[oi++] = *p++;
+                PUTO(*p);
+                p++;
             }
         }
+#undef PUTO
         o[oi] = '\0';
         argc++;
     }
@@ -293,6 +304,18 @@ TEST(win_cmdline_overflow_rejected) {
     PASS();
 }
 
+/* Reproduce-first guard for the overflow CONTRACT (subprocess.h): on overflow buf
+ * must be left a valid (empty) string. RED on the pre-fix code — the overflow path
+ * returned without terminating buf, so buf[0] held the first quoted byte ('"') —
+ * and GREEN once the overflow path sets buf[0] = '\0'. */
+TEST(win_cmdline_overflow_leaves_empty_string) {
+    char buf[8];
+    const char *const argv[] = {"averylongprogramname", "x", NULL};
+    ASSERT_FALSE(cbm_build_win_cmdline(buf, sizeof(buf), argv)); /* overflows cap */
+    ASSERT_EQ(buf[0], '\0'); /* pre-fix: buf[0] == '"' (a partial byte), not NUL */
+    PASS();
+}
+
 SUITE(subprocess) {
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
@@ -310,4 +333,5 @@ SUITE(subprocess) {
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);
     RUN_TEST(win_cmdline_overflow_rejected);
+    RUN_TEST(win_cmdline_overflow_leaves_empty_string);
 }

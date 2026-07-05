@@ -77,7 +77,8 @@ const char *cbm_proc_outcome_str(cbm_proc_outcome_t o);
 /* Build a Windows CreateProcess command line from a NULL-terminated argv, applying
  * the Microsoft C runtime quoting rules (quote-wrap + escape embedded quotes and
  * their preceding backslashes) so the spawned child re-parses byte-identical argv.
- * Returns true on success, false on overflow (buf then holds a truncated string).
+ * Returns true on success, false on overflow (on overflow buf is set to an empty
+ * string, never left unterminated).
  *
  * CreateProcess re-parses a SINGLE command string into argv, so a naive `"%s"` wrap
  * silently corrupts any element containing a double-quote — e.g. the index worker's
