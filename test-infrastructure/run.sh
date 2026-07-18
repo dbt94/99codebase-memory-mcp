@@ -7,8 +7,12 @@
 #   Linux portable: Alpine musl static build + smoke    [portable binary]
 #   Windows:        cross-compile with mingw-w64        [compile-check; Wine
 #                   CANNOT reproduce real Windows ACL/token/owner semantics —
-#                   those need a real Windows VM or the CI legs]
+#                   use the windows-vm leg for those]
 #   macOS:          run natively (not in Docker)
+#   windows-vm:     OPT-IN real Windows (UTM) — kernel-real ACL/token/owner
+#                   semantics incl. the runner default-owner policy (vm/README.md)
+#   mac-vm:         OPT-IN GitHub-runner macOS environment (Tart) — the env
+#                   class where runner-only failures reproduce (vm/README.md)
 #
 # Speed first: test containers run unconstrained by default. Before pushing
 # anything that touches timing, scheduling, or subprocess code, run ONE pass
@@ -144,8 +148,50 @@ case "${1:-full}" in
         echo "=== Debug shell (Alpine) ==="
         $COMPOSE run --rm --entrypoint bash test-portable
         ;;
+    windows-vm)
+        # OPT-IN: real Windows semantics (ACL/token/owner) — see vm/README.md.
+        [ -f "$ROOT/test-infrastructure/vm/config.env" ] && . "$ROOT/test-infrastructure/vm/config.env"
+        if [ -z "${CBM_WIN_VM_SSH:-}" ]; then
+            echo "windows-vm leg not configured (opt-in)." >&2
+            echo "  Setup: test-infrastructure/vm/README.md — UTM + CrystalFetch," >&2
+            echo "  run vm/windows-bootstrap.ps1 in the VM, then set CBM_WIN_VM_SSH" >&2
+            echo "  in test-infrastructure/vm/config.env" >&2
+            exit 2
+        fi
+        echo "=== Windows VM: sync + build + test (real ACL/token semantics) ==="
+        SUITES="${2:-}"
+        tar -C "$ROOT" --exclude build --exclude .git -cf - . | ssh "$CBM_WIN_VM_SSH" \
+            "C:/msys64/usr/bin/bash.exe -lc 'rm -rf /c/cbm/src && mkdir -p /c/cbm/src && cd /c/cbm/src && tar -xf - && scripts/test.sh CC=clang CXX=clang++ ${SUITES:+TEST_SUITES=\"$SUITES\"}'"
+        ;;
+    mac-vm)
+        # OPT-IN: GitHub-runner-equivalent macOS environment — see vm/README.md.
+        if ! command -v tart >/dev/null 2>&1 || ! tart list 2>/dev/null | grep -q cbm-mac-runner; then
+            echo "mac-vm leg not configured (opt-in)." >&2
+            echo "  Setup: brew trust cirruslabs/cli && brew install tart &&" >&2
+            echo "  tart clone ghcr.io/cirruslabs/macos-runner:sequoia cbm-mac-runner" >&2
+            exit 2
+        fi
+        echo "=== macOS runner VM: sync + test (GitHub-runner environment) ==="
+        tart run --no-graphics cbm-mac-runner >/dev/null 2>&1 &
+        TART_PID=$!
+        trap '{ kill "$TART_PID" 2>/dev/null || true; }' EXIT
+        VM_IP=""
+        for _ in $(seq 1 60); do
+            VM_IP=$(tart ip cbm-mac-runner 2>/dev/null) && [ -n "$VM_IP" ] && break
+            sleep 2
+        done
+        [ -n "$VM_IP" ] || { echo "ERROR: VM did not obtain an IP" >&2; exit 1; }
+        if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "admin@$VM_IP" true 2>/dev/null; then
+            echo "One-time: install your key in the VM (password: admin):" >&2
+            echo "  ssh-copy-id admin@$VM_IP" >&2
+            exit 2
+        fi
+        tar -C "$ROOT" --exclude build --exclude .git -cf - . | \
+            ssh -o BatchMode=yes "admin@$VM_IP" \
+            'rm -rf ~/cbm-src && mkdir -p ~/cbm-src && cd ~/cbm-src && tar -xf - && scripts/test.sh CC=cc CXX=c++'
+        ;;
     *)
-        echo "Usage: $0 {full|test|build|smoke|portable|portable-test|windows|amd64|all|lint|shell|shell-alpine}"
+        echo "Usage: $0 {full|test|build|smoke|portable|portable-test|windows|amd64|all|lint|shell|shell-alpine|windows-vm|mac-vm}"
         exit 1
         ;;
 esac
