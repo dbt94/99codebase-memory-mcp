@@ -13,10 +13,11 @@ policy on CI runners) need real Windows.
 
 One-time setup (~15 min interactive):
 
-1. `brew install --cask utm crystalfetch` (both free/open source).
-2. Open **CrystalFetch** → download the latest **Windows 11 ARM64** ISO
-   (fetched directly from Microsoft). Windows runs unactivated for testing
-   (cosmetic watermark); add a license if you want it clean.
+1. `brew install --cask utm` (free/open source).
+2. Download the official **Windows 11 ARM64** ISO from
+   https://www.microsoft.com/software-download/windows11arm64 (pick edition
+   + language; a plain resumable download). Windows runs unactivated for
+   testing (cosmetic watermark); add a license if you want it clean.
 3. Open **UTM** → New VM → Virtualize → Windows → select the ISO →
    ALL host cores / 16-24 GB. vCPUs are host-scheduled, not pinned: idle
    guest cores cost nothing and nothing is seized from parallel work — no
