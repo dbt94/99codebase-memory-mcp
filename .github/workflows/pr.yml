@@ -82,7 +82,11 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+
+      - name: Install ccache (macOS)
+        if: matrix.os == 'macos-14'
+        run: command -v ccache >/dev/null 2>&1 || brew install ccache
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         if: matrix.os == 'windows-latest'
@@ -93,14 +97,28 @@ jobs:
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-zlib
             mingw-w64-clang-x86_64-python3
+            mingw-w64-clang-x86_64-ccache
             make
             coreutils
+
+      # Verified compiler cache — content-keyed, stale hits impossible by
+      # construction (see scripts/env.sh).
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-smoke-${{ matrix.os }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-smoke-${{ matrix.os }}-${{ github.ref }}-
 
       - name: Build prod + smoke (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
           scripts/build.sh CC=gcc CXX=g++
           scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1000M
 
       - name: Build prod + smoke (macOS)
         if: matrix.os == 'macos-14'
@@ -108,6 +126,9 @@ jobs:
           scripts/build.sh CC=cc CXX=c++
           codesign --sign - --force build/c/codebase-memory-mcp
           scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1000M
 
       - name: Build prod + smoke (Windows)
         if: matrix.os == 'windows-latest'
@@ -127,6 +148,9 @@ jobs:
           CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")" \
             SMOKE_TEMP_ROOT="$SMOKE_DIR" \
             scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1000M
 
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage

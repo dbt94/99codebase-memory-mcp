@@ -81,12 +81,39 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: command -v ccache >/dev/null 2>&1 || brew install ccache
+
+      # Verified compiler cache: CCACHE_COMPILERCHECK=content keys every entry
+      # on the compiler-binary CONTENT plus the fully preprocessed input, so a
+      # hit is provably the identical compilation — a stale or foreign cache
+      # can only miss, never return wrong output (see scripts/env.sh).
+      # Keys embed github.ref on top of GitHub's own branch scoping: caches are
+      # STRICTLY per-ref by policy — no base-branch fallback, a new PR builds
+      # cold once and only its own pushes warm it.
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-
 
       - name: Test
         run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
 
   test-tsan:
     runs-on: ubuntu-latest
@@ -95,10 +122,33 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Ubuntu)
-        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev ccache
+
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-tsan-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-tsan-${{ github.ref }}-
 
       - name: ThreadSanitizer tests
-        run: make -f Makefile.cbm test-tsan CC=clang CXX=clang++
+        # This job calls make directly (no env.sh), so route the compilers
+        # through ccache's Debian masquerade dir; update-ccache-symlinks in the
+        # ccache postinst has already linked the clang installed above.
+        run: |
+          export PATH=/usr/lib/ccache:$PATH
+          export CCACHE_COMPILERCHECK=content
+          make -f Makefile.cbm test-tsan CC=clang CXX=clang++
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
 
   test-windows:
     needs: setup-matrix
@@ -119,6 +169,7 @@ jobs:
             mingw-w64-clang-${{ matrix.pkg }}-clang
             mingw-w64-clang-${{ matrix.pkg }}-compiler-rt
             mingw-w64-clang-${{ matrix.pkg }}-zlib
+            mingw-w64-clang-${{ matrix.pkg }}-ccache
             make
             git
 
@@ -146,6 +197,14 @@ jobs:
           Set-Acl -LiteralPath $root -AclObject $acl
           "CBM_CI_TEMP_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-
+
       - name: Test
         shell: msys2 {0}
         # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
@@ -164,6 +223,15 @@ jobs:
           scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && 'SANITIZE=' || '' }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
+
+      - name: ccache stats
+        if: always()
+        shell: msys2 {0}
+        run: ccache -s || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
 
   # Windows product-surface regression guards. Distinct from test-windows above
   # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
@@ -186,6 +254,7 @@ jobs:
           install: >-
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-ccache
             make
             git
 
@@ -197,11 +266,22 @@ jobs:
         working-directory: pkg/npm
         run: npm test
 
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-guards-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-guards-${{ github.ref }}-
+
       - name: Build product binary with embedded UI
         shell: msys2 {0}
         # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
         # guard's HTTP UI is available. Functional gate only (no sanitizers).
         run: scripts/build.sh --with-ui CC=clang CXX=clang++
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
 
       - name: Windows regression guards (#636/#357, #618, #548, #423/#20)
         shell: pwsh
