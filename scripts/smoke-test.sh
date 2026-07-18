@@ -624,7 +624,11 @@ echo "=== Phase 5: MCP stdio transport (agent handshake) ==="
 # Helper: run binary in background with input, wait up to N seconds, collect output
 mcp_run() {
   local input_file="$1" output_file="$2" max_wait="${3:-45}"
-  "$BINARY" < "$input_file" > "$output_file" 2>/dev/null &
+  # Keep the frontend's stderr instead of discarding it: with the daemon
+  # architecture, a first-session start/connect failure surfaces ONLY on
+  # stderr (stdout stays reserved for JSON-RPC), so 2>/dev/null turned every
+  # such failure into an undiagnosable "no id:1 response".
+  "$BINARY" < "$input_file" > "$output_file" 2>"${output_file}.err" &
   local pid=$!
   local waited=0
   while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$max_wait" ]; do
@@ -633,6 +637,23 @@ mcp_run() {
   done
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+}
+
+# Dump every daemon-side diagnostic for an MCP failure: the frontend stderr
+# and the durable daemon + conflict logs under the cache root.
+mcp_dump_diagnostics() {
+  local output_file="$1"
+  if [ -s "${output_file}.err" ]; then
+    echo "--- frontend stderr ---"
+    cat "${output_file}.err"
+  fi
+  local cache="${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"
+  for log in cbm-daemon.log daemon-conflicts.ndjson; do
+    if [ -s "$cache/logs/$log" ]; then
+      echo "--- $log (tail) ---"
+      tail -20 "$cache/logs/$log"
+    fi
+  done
 }
 
 MCP_INPUT=$(smoke_mktemp_file)
@@ -650,7 +671,8 @@ if ! grep -q '"id":1' "$MCP_OUTPUT"; then
   echo "FAIL: no initialize response (id:1) in MCP output"
   echo "Output was:"
   cat "$MCP_OUTPUT"
-  rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+  mcp_dump_diagnostics "$MCP_OUTPUT"
+  rm -f "$MCP_INPUT" "$MCP_OUTPUT" "${MCP_OUTPUT}.err"
   exit 1
 fi
 echo "OK: initialize response received (id:1)"
@@ -660,7 +682,8 @@ if ! grep -q '"id":2' "$MCP_OUTPUT"; then
   echo "FAIL: no tools/list response (id:2) in MCP output"
   echo "Output was:"
   cat "$MCP_OUTPUT"
-  rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+  mcp_dump_diagnostics "$MCP_OUTPUT"
+  rm -f "$MCP_INPUT" "$MCP_OUTPUT" "${MCP_OUTPUT}.err"
   exit 1
 fi
 echo "OK: tools/list response received (id:2)"
