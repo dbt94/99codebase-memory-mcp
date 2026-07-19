@@ -142,6 +142,12 @@ struct cbm_daemon_runtime_service {
     size_t worker_mutexes_initialized;
     size_t active_connections;
     size_t committed_clients;
+    /* Monotonic count of every admission since service start. The host's
+     * nobody-ever-connected window latches on this instead of sampling the
+     * live client count: a short-lived first session can begin and end
+     * entirely between two host polls, and a sampled count then reads zero
+     * forever, stopping a daemon whose client is mid-conversation. */
+    uint64_t admitted_total;
 
     cbm_thread_t accept_thread;
     bool accept_thread_started;
@@ -1019,10 +1025,16 @@ static void runtime_result_rejected(cbm_daemon_runtime_connect_result_t *result,
 }
 
 static void runtime_service_begin_stopping_locked(cbm_daemon_runtime_service_t *service,
-                                                  uint64_t deadline, bool emergency) {
+                                                  uint64_t deadline, bool emergency,
+                                                  const char *reason) {
     if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING) {
         service->state = CBM_DAEMON_RUNTIME_SERVICE_STOPPING;
         service->stop_deadline_ms = deadline;
+        /* The generation's fate is decided here by one of several owners
+         * (last-client exit, coordinator stop, activation drain, external
+         * stop). Sessions dropped by the losing side of a race are
+         * undiagnosable without naming which owner pulled the trigger. */
+        cbm_log_info("daemon.runtime_stopping", "reason", reason ? reason : "unspecified");
     } else if (service->state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING &&
                (service->stop_deadline_ms == 0 || deadline < service->stop_deadline_ms)) {
         service->stop_deadline_ms = deadline;
@@ -1033,10 +1045,11 @@ static void runtime_service_begin_stopping_locked(cbm_daemon_runtime_service_t *
 }
 
 static void runtime_service_begin_stopping(cbm_daemon_runtime_service_t *service,
-                                           uint32_t timeout_ms, bool emergency) {
+                                           uint32_t timeout_ms, bool emergency,
+                                           const char *reason) {
     uint64_t deadline = runtime_deadline_after(timeout_ms);
     cbm_mutex_lock(&service->mutex);
-    runtime_service_begin_stopping_locked(service, deadline, emergency);
+    runtime_service_begin_stopping_locked(service, deadline, emergency, reason);
     cbm_mutex_unlock(&service->mutex);
 }
 
@@ -1084,7 +1097,8 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
             /* A HELLO whose application session is still opening is only a
              * provisional coordinator client. It cannot keep the generation
              * alive after the final fully committed frontend disconnects. */
-            runtime_service_begin_stopping_locked(service, shutdown_deadline, false);
+            runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
+                                                  "last_committed_client_disconnected");
         }
     }
     cbm_mutex_unlock(&service->mutex);
@@ -1098,7 +1112,8 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
                                             worker->application_session);
     }
     if (cbm_daemon_coordinator_state(service->coordinator) == CBM_DAEMON_COORDINATOR_STOPPING) {
-        runtime_service_begin_stopping(service, service->shutdown_timeout_ms, false);
+        runtime_service_begin_stopping(service, service->shutdown_timeout_ms, false,
+                                       "coordinator_stopping");
     }
 }
 
@@ -1121,6 +1136,7 @@ static bool runtime_worker_admit(cbm_daemon_runtime_worker_t *worker,
             worker->client_id = client_id;
             worker->admitted = true;
             worker->admission_committed = false;
+            service->admitted_total++;
         }
     }
     cbm_mutex_unlock(&service->mutex);
@@ -1202,13 +1218,23 @@ static void *runtime_application_worker(void *opaque) {
         status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
     }
 
+    /* Completion must be one atomic transition from the client's point of
+     * view: publish the done flag BEFORE the response bytes leave, so by the
+     * time any client can react to the response, admission already observes
+     * this slot as reusable. With the store after the send, a client that
+     * pipelines its next request the moment it sees a response raced this
+     * thread's final instructions and was rejected BUSY — on loaded Windows
+     * hosts roughly half of all back-to-back requests on one connection,
+     * surfacing as the wandering Phase 5 session drops. The admission side
+     * joins this thread after observing the flag, which safely absorbs the
+     * tail of the send. */
+    atomic_store_explicit(&worker->application_thread_done, true, memory_order_release);
     bool sent = runtime_worker_send_application_response(worker, worker->application_request_token,
                                                          status, response, response_length, true);
     free(response);
     if (!sent && !atomic_load_explicit(&worker->disconnecting, memory_order_acquire)) {
         cbm_daemon_ipc_connection_interrupt(worker->connection);
     }
-    atomic_store_explicit(&worker->application_thread_done, true, memory_order_release);
     return NULL;
 }
 
@@ -1383,7 +1409,7 @@ static void runtime_worker_handle_activation_shutdown(cbm_daemon_runtime_worker_
         result.active_connections =
             service->active_connections > 0 ? (uint64_t)(service->active_connections - 1U) : 0;
         if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING) {
-            runtime_service_begin_stopping_locked(service, deadline, false);
+            runtime_service_begin_stopping_locked(service, deadline, false, "activation_shutdown");
             service->activation_shutdown_requested = true;
             service->activation_response_inflight = true;
             worker->final_response_inflight = true;
@@ -1569,6 +1595,15 @@ static void *runtime_connection_worker(void *opaque) {
         received = cbm_daemon_ipc_receive_frame(worker->connection, CBM_DAEMON_IPC_WAIT_FOREVER,
                                                 &frame, &payload);
         if (received != 1 || frame.type != CBM_DAEMON_FRAME_REQUEST) {
+            /* An admitted frontend disconnecting decides the daemon's fate
+             * (last committed client ends the generation), so the transport
+             * cause must be visible: 0 = orderly EOF, negative = transport
+             * error. A silent break here previously made session-drop races
+             * undiagnosable across three platforms. */
+            char received_text[16];
+            (void)snprintf(received_text, sizeof(received_text), "%d", received);
+            cbm_log_info("daemon.connection_end", "received", received_text, "frame_type",
+                         received == 1 ? "non_request" : "none");
             break;
         }
         switch (frame.flags) {
@@ -2026,6 +2061,16 @@ cbm_daemon_runtime_service_state_t cbm_daemon_runtime_service_state(
     return state;
 }
 
+uint64_t cbm_daemon_runtime_service_clients_admitted_total(cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return 0;
+    }
+    cbm_mutex_lock(&service->mutex);
+    uint64_t total = service->admitted_total;
+    cbm_mutex_unlock(&service->mutex);
+    return total;
+}
+
 size_t cbm_daemon_runtime_service_active_clients(cbm_daemon_runtime_service_t *service) {
     if (!service) {
         return 0;
@@ -2129,7 +2174,7 @@ bool cbm_daemon_runtime_service_stop(cbm_daemon_runtime_service_t *service, uint
     if (cbm_daemon_runtime_service_state(service) == CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
         return cbm_daemon_runtime_service_wait_exited(service, timeout_ms);
     }
-    runtime_service_begin_stopping(service, timeout_ms, true);
+    runtime_service_begin_stopping(service, timeout_ms, true, "service_stop");
     runtime_service_interrupt_connections(service);
     return cbm_daemon_runtime_service_wait_exited(service, timeout_ms);
 }

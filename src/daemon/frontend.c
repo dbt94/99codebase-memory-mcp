@@ -27,12 +27,18 @@ enum {
      * close stdin before the worker is scheduled. Give already-accepted input
      * a short FIFO drain window so EOF cannot silently discard it. A genuinely
      * active long operation is still cancelled at this deadline. */
-    FRONTEND_EOF_DRAIN_MS = 1000,
     FRONTEND_WAIT_US = 1000,
     /* An idle thin frontend owns no work and only needs to notice the next
      * queue item promptly. Ten milliseconds avoids a 1 kHz wake-up loop per
      * connected coding-agent session without perceptible request latency. */
     FRONTEND_IDLE_WAIT_US = 10 * 1000,
+    /* EOF-drain progress window. Sized to cover a cold daemon spawn plus one
+     * request round-trip on the slowest platform (several seconds on Windows
+     * under CI load): the drain aborts only after this long with NO item
+     * completing, so batch clients that close stdin after writing keep
+     * receiving every response while a genuinely stuck request still gets
+     * cancelled and the frontend exits cleanly. */
+    FRONTEND_EOF_DRAIN_MS = 15000,
     FRONTEND_MAINTENANCE_POLL_MS = 10,
     /* The owner thread may be draining a supervised process tree. Preserve the
      * supervisor's complete graceful + forced-settle window before the monitor
@@ -71,6 +77,10 @@ typedef struct {
     const char *active_id_str;
     cbm_daemon_runtime_application_token_t active_request_token;
     bool failed;
+    /* Monotonic count of fully processed queue items (responses written or
+     * cancellations acknowledged). The EOF drain below watches it to tell a
+     * batch that is still making progress from a genuinely stuck request. */
+    atomic_uint_fast64_t completed_items;
 } frontend_state_t;
 
 typedef struct {
@@ -190,7 +200,15 @@ static void frontend_item_free(frontend_item_t *item) {
 
 static bool frontend_should_stop(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
-    bool stopping = state->stopping || (state->input_closed && state->count == 0);
+    /* The input-closed leg must also require that no item is IN FLIGHT: the
+     * worker consults this while deciding whether a request failure was an
+     * expected shutdown, and the final queued item after EOF has count == 0
+     * precisely while its own forward is outstanding. Without the in_request
+     * term, any daemon-side failure of that last item was classified as an
+     * expected stop and its response silently dropped with a success exit —
+     * an unanswerable failure mode for the client. */
+    bool stopping =
+        state->stopping || (state->input_closed && state->count == 0 && !state->in_request);
     cbm_mutex_unlock(&state->mutex);
     return stopping;
 }
@@ -438,6 +456,7 @@ static void *frontend_worker(void *opaque) {
         bool expected_stop = failed && frontend_should_stop(state);
         frontend_end_request(state, failed && !expected_stop);
         frontend_item_free(&item);
+        atomic_fetch_add_explicit(&state->completed_items, 1, memory_order_release);
         if (failed) {
             if (!expected_stop) {
                 /* A failed daemon transport cannot wake a thread blocked in
@@ -540,6 +559,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         .out = out,
     };
     cbm_mutex_init(&state.mutex);
+    atomic_init(&state.completed_items, 0);
     cbm_daemon_maintenance_monitor_t *maintenance_monitor = cbm_daemon_maintenance_monitor_start(
         cohort_manager, frontend_cancel_for_maintenance, &state, EXIT_SUCCESS, "MCP frontend");
     if (!maintenance_monitor) {
@@ -598,11 +618,28 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
 
     if (clean_eof && !close_begun) {
         frontend_input_closed(&state);
-        uint64_t now = cbm_now_ms();
-        uint64_t drain_deadline =
-            now > UINT64_MAX - FRONTEND_EOF_DRAIN_MS ? UINT64_MAX : now + FRONTEND_EOF_DRAIN_MS;
+        /* EOF ends INPUT, not accepted work: as long as queued items keep
+         * completing, every already-enqueued request still receives its
+         * response, exactly like the pre-daemon stdio server, which
+         * processed the whole stream before exiting. The window resets on
+         * each completed item, so it bounds STUCKNESS, not batch length: a
+         * request making no progress for the full window is cancelled by the
+         * stop path below and the frontend still exits cleanly. The previous
+         * fixed 1s total window abandoned queued requests whenever the
+         * daemon cold spawn plus the first request outlasted it (several
+         * seconds on Windows), so batch clients that close stdin right after
+         * writing — file redirects, piped harnesses, hook one-shots —
+         * intermittently lost their tail responses. */
+        uint64_t drained = atomic_load_explicit(&state.completed_items, memory_order_acquire);
+        uint64_t drain_deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
         while (!frontend_worker_is_done(&state) && cbm_now_ms() < drain_deadline) {
             cbm_usleep(FRONTEND_WAIT_US);
+            uint64_t now_drained =
+                atomic_load_explicit(&state.completed_items, memory_order_acquire);
+            if (now_drained != drained) {
+                drained = now_drained;
+                drain_deadline = cbm_now_ms() + FRONTEND_EOF_DRAIN_MS;
+            }
         }
     }
     if (!close_begun) {

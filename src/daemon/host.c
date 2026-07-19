@@ -679,11 +679,11 @@ static bool host_background_start(host_state_t *host) {
 static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
                                    atomic_int *stop_requested, host_state_t *host) {
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
-    bool admitted = false;
     uint64_t stopping_deadline = 0;
     for (;;) {
         cbm_daemon_runtime_service_state_t state = cbm_daemon_runtime_service_state(service);
         if (state == CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
+            cbm_log_info("daemon.lifetime_end", "reason", "runtime_exited");
             return true;
         }
         if (state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING) {
@@ -696,11 +696,16 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
             (void)cbm_daemon_runtime_service_wait_exited(service, HOST_WAIT_TICK_MS);
             continue;
         }
-        if (cbm_daemon_runtime_service_active_clients(service) > 0) {
-            admitted = true;
-        }
+        /* The nobody-ever-connected window latches on the monotonic admission
+         * total, not the live client count: a short first session can begin
+         * and end entirely between two polls of this loop, and a sampled
+         * count then reads zero forever — stopping a daemon whose client is
+         * mid-conversation between per-request connections. */
+        bool admitted = cbm_daemon_runtime_service_clients_admitted_total(service) > 0;
         bool stop = stop_requested && atomic_load(stop_requested);
         if (stop || (!admitted && cbm_now_ms() >= initial_deadline)) {
+            cbm_log_info("daemon.lifetime_end", "reason",
+                         stop ? "stop_requested" : "initial_window_expired");
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
         }
         host_http_reconcile_at(host, cbm_now_ms(), false);

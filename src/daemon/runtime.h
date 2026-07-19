@@ -248,6 +248,10 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
 cbm_daemon_runtime_service_state_t cbm_daemon_runtime_service_state(
     cbm_daemon_runtime_service_t *service);
 size_t cbm_daemon_runtime_service_active_clients(cbm_daemon_runtime_service_t *service);
+/* Monotonic count of every admission since service start; never decremented.
+ * Use for "has any client ever connected" decisions — the live count above
+ * can read zero between two short-lived sessions. */
+uint64_t cbm_daemon_runtime_service_clients_admitted_total(cbm_daemon_runtime_service_t *service);
 /* Includes accepted connections still waiting for HELLO. Never exceeds the
  * configured max_clients; over-cap peers receive REJECTED before close. */
 size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_t *service);
