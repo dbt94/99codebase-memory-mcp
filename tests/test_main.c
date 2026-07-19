@@ -648,6 +648,17 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    /* Skip the multi-hundred-MB executable-image hash that computes the exact
+     * build fingerprint: it is tens of seconds per spawned worker/daemon under
+     * ASan on constrained CI runners and the sole cause of the daemon-family
+     * readiness-timeout flakes. Set once here; every forked child and re-exec'd
+     * worker inherits it, so exact-build match/mismatch still works (a
+     * mismatch test still passes a DIFFERENT fingerprint via argv). Honoured
+     * only under CBM_CLI_ENABLE_TEST_API — never in a production binary. */
+    if (!getenv("CBM_TEST_BUILD_FINGERPRINT")) {
+        (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
+                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
+    }
     int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
     if (blocking_git_rc >= 0) {
         return blocking_git_rc;

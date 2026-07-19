@@ -84,11 +84,30 @@ size_t cbm_index_worker_memory_budget_bytes(void) {
     return g_worker_memory_budget_bytes;
 }
 
+static bool worker_fingerprint_valid(const char *fingerprint);
+
 bool cbm_index_supervisor_capture_build_fingerprint(void) {
     if (g_build_fingerprint_capture_attempted) {
         return g_build_fingerprint[0] != '\0';
     }
     g_build_fingerprint_capture_attempted = true;
+#if defined(CBM_CLI_ENABLE_TEST_API)
+    /* Test-only seam: computing the real fingerprint hashes the ENTIRE
+     * executable image, which for the ASan test-runner (hundreds of MB) takes
+     * tens of seconds per spawned worker/daemon on constrained CI runners and
+     * is the sole cause of the daemon-family readiness-timeout flakes. When a
+     * valid stub is provided the hash is skipped; every process in the test
+     * (parent, forked children, re-exec'd workers) inherits the same stub via
+     * the environment, so exact-build match/mismatch behaviour is preserved
+     * while startup becomes instant. Never compiled into production. */
+    char test_fingerprint[CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE];
+    const char *test_value = cbm_safe_getenv("CBM_TEST_BUILD_FINGERPRINT", test_fingerprint,
+                                             sizeof(test_fingerprint), NULL);
+    if (test_value && worker_fingerprint_valid(test_value)) {
+        (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", test_value);
+        return true;
+    }
+#endif
     char captured[CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE] = {0};
     if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)worker_getpid(), captured)) {
         return false;
