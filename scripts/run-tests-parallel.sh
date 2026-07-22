@@ -52,6 +52,55 @@ if [ "$NSUITES" -lt 1 ] || grep -qvE '^[a-z0-9_]+$' "$SUITES_FILE"; then
     echo "FAIL: suite list empty or malformed (runner too old for --list-suites?)" >&2
     exit 1
 fi
+
+# CBM_TEST_SHARD="i/N" runs this invocation's deterministic slice of the
+# suite list so CI can spread one platform's suites across N runner jobs.
+# Unset (or "1/1") selects everything — the sharding path is inert unless a
+# workflow opts in. The slice is a pure function of (--list-suites, i, N):
+# every shard recomputes the same assignment, so N jobs with indices 1..N
+# cover the full list by construction, and each job's union guard below
+# proves it ran exactly its slice.
+SHARD_INDEX=1
+SHARD_TOTAL=1
+if [ -n "${CBM_TEST_SHARD:-}" ]; then
+    if ! printf '%s' "$CBM_TEST_SHARD" | grep -qE '^[0-9]+/[0-9]+$'; then
+        echo "FAIL: CBM_TEST_SHARD must be i/N, got '$CBM_TEST_SHARD'" >&2
+        exit 1
+    fi
+    SHARD_INDEX="${CBM_TEST_SHARD%%/*}"
+    SHARD_TOTAL="${CBM_TEST_SHARD##*/}"
+    if [ "$SHARD_TOTAL" -lt 1 ] || [ "$SHARD_INDEX" -lt 1 ] ||
+        [ "$SHARD_INDEX" -gt "$SHARD_TOTAL" ]; then
+        echo "FAIL: CBM_TEST_SHARD out of range: $CBM_TEST_SHARD" >&2
+        exit 1
+    fi
+fi
+
+# Deal the known-heavy suites round-robin FIRST so no shard receives a
+# second heavy suite before every shard holds one — shard wall time is
+# bounded by its heaviest member, and naive modulo can stack store_arch and
+# daemon_runtime (the two slowest sanitized suites) onto one job.
+shard_filter() {
+    awk -v idx="$SHARD_INDEX" -v total="$SHARD_TOTAL" '
+        BEGIN {
+            nh = split("store_arch daemon_runtime incremental cli extraction " \
+                       "watcher daemon_ipc subprocess httpd py_lsp_stress " \
+                       "grammar_regression mcp daemon_frontend pipeline", h, " ")
+        }
+        { present[$0] = NR; lines[NR] = $0 }
+        END {
+            # Deal heavies in WEIGHT order (the static list above), not file
+            # order: the point is that the two slowest suites land on
+            # different shards, which file-order dealing does not guarantee.
+            n = 0
+            for (i = 1; i <= nh; i++)
+                if (h[i] in present) { order[++n] = h[i]; taken[h[i]] = 1 }
+            for (i = 1; i <= NR; i++)
+                if (!(lines[i] in taken)) order[++n] = lines[i]
+            for (i = 1; i <= n; i++) if ((i - 1) % total == idx - 1) print order[i]
+        }
+    '
+}
 # Timing-sensitive suites run SEQUENTIALLY after the parallel wave: they
 # spawn subprocesses / watch the filesystem / bind ports with fixed
 # deadlines, and a saturated 4-core CI runner starves those deadlines into
@@ -87,7 +136,16 @@ while IFS= read -r sname; do
         echo "$sname" >> "$PAR_FILE"
     fi
 done < "$SUITES_FILE"
-echo "=== parallel test run: $NSUITES suites ($(wc -l < "$SER_FILE" | tr -d ' ') serial-tail), $JOBS jobs ==="
+
+# The parallel wave and the serial tail are sharded separately: every shard
+# keeps its own quiet tail for the deadline-sensitive suites (its runner is
+# a whole machine, so the tail is at least as quiet as before sharding).
+shard_filter < "$PAR_FILE" > "$PAR_FILE.shard" && mv "$PAR_FILE.shard" "$PAR_FILE"
+shard_filter < "$SER_FILE" > "$SER_FILE.shard" && mv "$SER_FILE.shard" "$SER_FILE"
+SHARD_EXPECT="$LOGDIR/suites-shard.txt"
+cat "$PAR_FILE" "$SER_FILE" > "$SHARD_EXPECT"
+NSHARD=$(wc -l < "$SHARD_EXPECT" | tr -d ' ')
+echo "=== parallel test run: $NSHARD of $NSUITES suites (shard ${SHARD_INDEX}/${SHARD_TOTAL}, $(wc -l < "$SER_FILE" | tr -d ' ') serial-tail), $JOBS jobs ==="
 
 export RUNNER LOGDIR RESULTS_FILE
 run_one() {
@@ -96,11 +154,14 @@ run_one() {
     # Per-suite wall-clock ceiling so a wedged suite fails LOUDLY instead of
     # blocking the run (and the single local build slot) indefinitely. The
     # `incremental` suite legitimately re-indexes large fixtures (minutes) so
-    # it gets a wider ceiling until the template-DB fixture refactor lands.
+    # it gets a wider ceiling until the template-DB fixture refactor lands;
+    # `daemon_runtime` measures ~610s SOLO on arm64 under ASan (10-round
+    # loop), so on an overloaded 4-job CI runner the 900s default is a
+    # slowness kill, not a hang detector — it joins the slow tier.
     # Uses `timeout` where available (always in the Linux container / CI); on a
     # host without it the suite runs uncapped (no regression vs before).
     case "$s" in
-        incremental | store_arch) st="${CBM_SUITE_TIMEOUT_SLOW:-3600}" ;;
+        incremental | store_arch | daemon_runtime) st="${CBM_SUITE_TIMEOUT_SLOW:-3600}" ;;
         *) st="${CBM_SUITE_TIMEOUT:-900}" ;;
     esac
     if command -v timeout >/dev/null 2>&1; then
@@ -130,12 +191,30 @@ while IFS= read -r sname; do
     run_one "$sname"
 done < "$SER_FILE"
 
-# ── Union guard: every listed suite produced exactly one result ──
-MISSING=$(comm -23 <(sort "$SUITES_FILE") <(awk '{print $1}' "$RESULTS_FILE" | sort -u))
+# Machine-checkable manifest for CI's cross-shard completeness job: it
+# proves at runtime that the shards of one leg agree on N and on the full
+# suite list, and that the union of their slices IS that list — the guard
+# against a mis-plumbed CBM_TEST_SHARD (two jobs running the same slice
+# passes every per-shard check but silently drops a slice; only a
+# cross-shard view catches it).
+{
+    echo "leg=${CBM_TEST_LEG:-local}"
+    echo "shard=${SHARD_INDEX}/${SHARD_TOTAL}"
+    echo "list_sha256=$(sort "$SUITES_FILE" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
+    echo "--- slice ---"
+    cat "$SHARD_EXPECT"
+} > "$LOGDIR/shard-manifest.txt"
+
+# ── Union guard: every suite in this shard's slice produced exactly one
+# result. The slice is deterministic, so N green shard jobs = full coverage;
+# a shard that ran anything more, less, or twice fails here. ──
+MISSING=$(comm -23 <(sort "$SHARD_EXPECT") <(awk '{print $1}' "$RESULTS_FILE" | sort -u))
+EXTRA=$(comm -13 <(sort "$SHARD_EXPECT") <(awk '{print $1}' "$RESULTS_FILE" | sort -u))
 DUPES=$(awk '{print $1}' "$RESULTS_FILE" | sort | uniq -d)
-if [ -n "$MISSING" ] || [ -n "$DUPES" ]; then
-    echo "FAIL: shard union does not match --list-suites (GATE-QUALITY LOSS)" >&2
+if [ -n "$MISSING" ] || [ -n "$EXTRA" ] || [ -n "$DUPES" ]; then
+    echo "FAIL: shard union does not match its --list-suites slice (GATE-QUALITY LOSS)" >&2
     [ -n "$MISSING" ] && echo "  never ran: $MISSING" >&2
+    [ -n "$EXTRA" ] && echo "  outside slice: $EXTRA" >&2
     [ -n "$DUPES" ] && echo "  ran twice: $DUPES" >&2
     exit 1
 fi
