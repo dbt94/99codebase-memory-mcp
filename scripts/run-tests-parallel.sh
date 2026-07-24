@@ -48,16 +48,41 @@ mkdir -p "$LOGDIR"
 # setup. Two idempotent steps: protect the DIRECTORY (inheritance flags are
 # directory-only — a /T re-root leaves files with empty deny-all DACLs),
 # then /reset the children to re-inherit the clean set.
-case "$(uname -s 2>/dev/null)" in
-MINGW* | MSYS*)
+stamp_windows_build_dir() {
+    local when="$1"
+    case "$(uname -s 2>/dev/null)" in
+    MINGW* | MSYS*) ;;
+    *) return 0 ;;
+    esac
+    local runner_dir_w me norm_out stamp_out reset_out
     runner_dir_w="$(cygpath -w "$(dirname "$RUNNER")")"
     me="$(whoami | tr -d '\r')"
-    MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
+    # Normalize FIRST: some runner images stamp EXPLICIT (non-inherited)
+    # Authenticated-Users ACEs onto the workspace tree, which /inheritance:r
+    # cannot strip and /grant:r does not touch (it replaces only the granted
+    # SIDs' own entries). /reset drops every explicit ACE and restores pure
+    # inheritance, so the protect-and-grant below starts from a known shape
+    # regardless of image provisioning.
+    norm_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /reset /Q 2>&1) ||
+        echo "WARN: build-dir DACL normalize ($when) failed: $norm_out"
+    stamp_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" /inheritance:r \
         /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
-        /Q >/dev/null 2>&1 || true
-    MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q >/dev/null 2>&1 || true
-    ;;
-esac
+        /Q 2>&1) || echo "WARN: build-dir DACL stamp ($when) failed (user=$me dir=$runner_dir_w): $stamp_out"
+    reset_out=$(MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q 2>&1) ||
+        echo "WARN: build-dir child DACL reset ($when) failed: $(printf '%s' "$reset_out" | tail -2)"
+    # The stamp is load-bearing for the install-flow suites: verify it and say
+    # so, in either direction — a silent stamp once cost a full CI round to
+    # even see WHETHER it had run.
+    if MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" 2>/dev/null |
+        grep -qE 'Authenticated Users|CREATOR OWNER'; then
+        echo "FAIL: build-dir DACL still grants cross-account mutation after $when stamp:"
+        MSYS2_ARG_CONV_EXCL='*' icacls "$runner_dir_w" 2>&1 | head -8
+        exit 1
+    else
+        echo "build-dir DACL stamped clean ($when, $runner_dir_w, user=$me)"
+    fi
+}
+stamp_windows_build_dir pre-wave
 
 SUITES_FILE="$LOGDIR/suites.txt"
 RESULTS_FILE="$LOGDIR/results.txt"
@@ -199,6 +224,14 @@ run_one() {
     fi
     secs=$((SECONDS - t0))
     summary=$(grep -E '^  [0-9]+ passed' "$LOGDIR/$s.log" | tail -1)
+    # A suite that exits 0 WITHOUT printing its completion summary ran zero
+    # tests as far as anyone can prove (mis-parsed argv, drifted registration
+    # macro, early return) — that is a failure, not a green with pass=0.
+    if [ "$rc" -eq 0 ] && [ -z "$summary" ]; then
+        rc=97
+        echo "  FAIL: suite '$s' exited 0 without a completion summary (ran nothing?)" \
+            >> "$LOGDIR/$s.log"
+    fi
     pass=$(printf '%s' "$summary" | sed -n 's/^  \([0-9]*\) passed.*/\1/p')
     failn=$(printf '%s' "$summary" | sed -n 's/.* \([0-9]*\) failed.*/\1/p')
     skip=$(printf '%s' "$summary" | sed -n 's/.* \([0-9]*\) skipped.*/\1/p')
@@ -232,6 +265,13 @@ while IFS= read -r sname; do
         echo "$sname" >> "$FLEX_FILE"
     fi
 done < "$SER_FILE"
+# Wave suites spawn Cygwin-family tooling that can rewrite the build
+# directory's DACL behind the first stamp (observed: an arm shard whose
+# tail held the install-flow suites failed the source-directory policy
+# minutes after a clean pre-wave stamp, while its sibling shard passed).
+# Re-stamp at the tail boundary so the deadline-sensitive tail — which
+# hosts those suites — always starts from the verified-clean shape.
+stamp_windows_build_dir pre-tail
 xargs -P "${CBM_TAIL_JOBS:-2}" -I{} bash -c 'run_one "$@"' _ {} < "$FLEX_FILE"
 while IFS= read -r sname; do
     run_one "$sname"
